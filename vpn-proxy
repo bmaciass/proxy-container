@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly validator="$project_dir/catalog.awk"
+readonly default_catalog="$project_dir/destinations.csv"
+readonly default_profile="$project_dir/secrets/client.ovpn"
+readonly image_name="${VPN_PROXY_IMAGE:-arkho-vpn-db-proxy:local}"
+readonly container_name="${VPN_PROXY_CONTAINER:-arkho-vpn-db-proxy}"
+
+catalog="${VPN_PROXY_CATALOG:-$default_catalog}"
+profile="${VPN_PROFILE:-$default_profile}"
+
+usage() {
+    cat <<'EOF'
+Usage: ./vpn-proxy COMMAND
+
+Commands:
+  validate                 Validate destinations.csv without using Docker
+  build                    Build the local container image
+  install-profile [PATH]   Securely copy an .ovpn profile into secrets/
+  start                    Prompt for VPN credentials and run in foreground
+
+Environment overrides:
+  VPN_PROXY_CATALOG        Destination catalog path
+  VPN_PROFILE              OpenVPN profile path
+  VPN_PROXY_IMAGE          Container image name
+  VPN_PROXY_CONTAINER      Container name
+EOF
+}
+
+validate_catalog() {
+    local require_enabled="${1:-0}"
+    [[ -r "$catalog" ]] || { echo "fatal: catalog is not readable: $catalog" >&2; return 1; }
+    awk -v mode=summary -v require_enabled="$require_enabled" -f "$validator" "$catalog"
+}
+
+check_docker() {
+    command -v docker >/dev/null 2>&1 || {
+        echo "fatal: Docker CLI is not installed" >&2
+        return 1
+    }
+    docker info >/dev/null 2>&1 || {
+        echo "fatal: cannot access the Docker daemon as user $(id -un)" >&2
+        echo "Start Docker and grant this user daemon access; this launcher will not invoke sudo automatically." >&2
+        return 1
+    }
+}
+
+check_tun() {
+    [[ -c /dev/net/tun ]] || {
+        echo "fatal: /dev/net/tun does not exist or is not a character device" >&2
+        return 1
+    }
+}
+
+build_image() {
+    check_docker
+    docker build --tag "$image_name" "$project_dir"
+}
+
+install_profile() {
+    local source_profile="${1:-$HOME/Downloads/sslvpn-vpn_arkho_bm-client-config-v2.ovpn}"
+    [[ -f "$source_profile" ]] || { echo "fatal: profile not found: $source_profile" >&2; return 1; }
+    mkdir -p "$project_dir/secrets"
+    chmod 0700 "$project_dir/secrets"
+    install -m 0600 "$source_profile" "$default_profile"
+    echo "Installed protected profile at $default_profile"
+}
+
+start_proxy() {
+    local vpn_username vpn_password vpn_otp runtime_dir auth_file
+    local name hostname remote_ip remote_port local_port database enabled
+    local exit_status profile_mode
+    declare -a docker_args=()
+
+    validate_catalog 1
+    check_docker
+    check_tun
+    [[ -r "$profile" ]] || {
+        echo "fatal: VPN profile is not readable: $profile" >&2
+        echo "Run ./vpn-proxy install-profile first, or set VPN_PROFILE." >&2
+        return 1
+    }
+
+    profile_mode=$(stat -c '%a' "$profile")
+    if (( (8#$profile_mode & 077) != 0 )); then
+        echo "fatal: VPN profile must not be accessible by group or other users; run: chmod 600 '$profile'" >&2
+        return 1
+    fi
+
+    if ! docker image inspect "$image_name" >/dev/null 2>&1; then
+        echo "Image $image_name is missing; building it now."
+        docker build --tag "$image_name" "$project_dir"
+    fi
+
+    read -r -p "VPN username: " vpn_username
+    read -r -s -p "VPN password: " vpn_password
+    printf '\n'
+    read -r -s -p "VPN OTP: " vpn_otp
+    printf '\n'
+
+    [[ -n "$vpn_username" && -n "$vpn_password" && -n "$vpn_otp" ]] || {
+        echo "fatal: username, password, and OTP are all required" >&2
+        return 1
+    }
+
+    runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/vpn-db-proxy.XXXXXX")
+    chmod 0700 "$runtime_dir"
+    auth_file="$runtime_dir/auth.txt"
+    printf '%s\n%s%s\n' "$vpn_username" "$vpn_password" "$vpn_otp" > "$auth_file"
+    chmod 0600 "$auth_file"
+    unset vpn_username vpn_password vpn_otp
+
+    cleanup_auth() {
+        if [[ -n "${auth_file:-}" ]]; then
+            rm -f -- "$auth_file"
+        fi
+        if [[ -n "${runtime_dir:-}" ]]; then
+            rmdir -- "$runtime_dir" 2>/dev/null || true
+        fi
+    }
+    trap cleanup_auth EXIT INT TERM
+
+    while IFS=, read -r name hostname remote_ip remote_port local_port database enabled; do
+        docker_args+=(--publish "127.0.0.1:${local_port}:${local_port}/tcp")
+    done < <(awk -v mode=records -v require_enabled=1 -f "$validator" "$catalog")
+
+    echo "Starting $container_name. The host network namespace will not be modified."
+    set +e
+    docker run --rm \
+        --name "$container_name" \
+        --hostname vpn-db-proxy \
+        --cap-drop ALL \
+        --cap-add NET_ADMIN \
+        --cap-add DAC_READ_SEARCH \
+        --device /dev/net/tun \
+        --security-opt no-new-privileges:true \
+        --read-only \
+        --tmpfs /run:rw,noexec,nosuid,size=16m \
+        --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+        --stop-timeout 10 \
+        --mount "type=bind,src=$profile,dst=/vpn/client.ovpn,readonly" \
+        --mount "type=bind,src=$catalog,dst=/config/destinations.csv,readonly" \
+        --mount "type=bind,src=$auth_file,dst=/run-auth/auth.txt,readonly" \
+        "${docker_args[@]}" \
+        "$image_name"
+    exit_status=$?
+    set -e
+    cleanup_auth
+    trap - EXIT INT TERM
+    return "$exit_status"
+}
+
+command_name="${1:-}"
+case "$command_name" in
+    validate)
+        validate_catalog 0
+        ;;
+    build)
+        build_image
+        ;;
+    install-profile)
+        install_profile "${2:-}"
+        ;;
+    start)
+        start_proxy
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

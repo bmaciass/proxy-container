@@ -1,0 +1,4 @@
+secrets/*
+!secrets/README.md
+destinations.csv
+
