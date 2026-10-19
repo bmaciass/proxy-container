@@ -1,4 +1,3 @@
 # Lines beginning with # and blank lines are ignored. CSV quoting is not supported.
-name,hostname,remote_ip,remote_port,local_port,database,enabled
-example,db.internal.example,10.0.0.10,5432,15432,appdb,false
-
+name,hostname,remote_ip,remote_port,local_port,database,credentials_file,enabled
+example,db.internal.example,10.0.0.10,5432,15432,appdb,credentials,false

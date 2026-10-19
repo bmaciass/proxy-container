@@ -3,36 +3,122 @@ set -Eeuo pipefail
 
 readonly project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly validator="$project_dir/catalog.awk"
+readonly web_validator="$project_dir/web-catalog.awk"
 readonly default_catalog="$project_dir/destinations.csv"
+readonly default_web_catalog="$project_dir/web-hosts.csv"
 readonly default_profile="$project_dir/secrets/client.ovpn"
+readonly secrets_dir="$project_dir/secrets"
+readonly default_vpn_credentials_file="vpn_credentials"
 readonly image_name="${VPN_PROXY_IMAGE:-arkho-vpn-db-proxy:local}"
 readonly container_name="${VPN_PROXY_CONTAINER:-arkho-vpn-db-proxy}"
 
 catalog="${VPN_PROXY_CATALOG:-$default_catalog}"
+web_catalog="${VPN_PROXY_WEB_CATALOG:-$default_web_catalog}"
 profile="${VPN_PROFILE:-$default_profile}"
+vpn_credentials_file="${VPN_CREDENTIALS_FILE:-$default_vpn_credentials_file}"
 
 usage() {
     cat <<'EOF'
 Usage: ./vpn-proxy COMMAND
 
 Commands:
-  validate                 Validate destinations.csv without using Docker
+  validate                 Validate database and web host catalogs
   build                    Build the local container image
   install-profile [PATH]   Securely copy an .ovpn profile into secrets/
-  start                    Prompt for VPN credentials and run in foreground
+  start                    Prompt for the VPN OTP and run in foreground
 
 Environment overrides:
   VPN_PROXY_CATALOG        Destination catalog path
+  VPN_PROXY_WEB_CATALOG    Web host catalog path
   VPN_PROFILE              OpenVPN profile path
+  VPN_CREDENTIALS_FILE     VPN username/password filename within secrets/
   VPN_PROXY_IMAGE          Container image name
   VPN_PROXY_CONTAINER      Container name
 EOF
 }
 
+database_reserved_ports() {
+    local name hostname remote_ip remote_port local_port database credentials_file enabled
+    local separator=""
+
+    while IFS=, read -r name hostname remote_ip remote_port local_port database credentials_file enabled; do
+        printf '%s%s' "$separator" "$local_port"
+        separator=" "
+    done < <(awk -v mode=records -v require_enabled=0 -f "$validator" "$catalog")
+}
+
+web_records() {
+    local reserved_ports
+    reserved_ports=$(database_reserved_ports)
+    awk -v mode=records -v require_enabled=0 -v reserved_ports="$reserved_ports" \
+        -f "$web_validator" "$web_catalog"
+}
+
+validate_web_catalog() {
+    local reserved_ports
+
+    [[ -r "$web_catalog" ]] || {
+        echo "fatal: web catalog is not readable: $web_catalog" >&2
+        return 1
+    }
+    reserved_ports=$(database_reserved_ports)
+    awk -v mode=summary -v require_enabled=0 -v reserved_ports="$reserved_ports" \
+        -f "$web_validator" "$web_catalog"
+}
+
+validate_all_catalogs() {
+    local require_database="${1:-0}"
+    validate_catalog "$require_database"
+    validate_web_catalog
+}
+
+validate_credentials_file() {
+    local path="$1" label="$2"
+
+    [[ -f "$path" ]] || {
+        echo "fatal: $label file not found: $path" >&2
+        return 1
+    }
+    [[ -r "$path" ]] || {
+        echo "fatal: $label file is not readable: $path" >&2
+        return 1
+    }
+    if ! awk -F, '
+        NR > 1 || NF != 2 || $1 == "" || $2 == "" { invalid = 1 }
+        END { exit (NR != 1 || invalid) }
+    ' "$path"; then
+        echo "fatal: $label file must contain exactly one non-empty username,password record: $path" >&2
+        return 1
+    fi
+}
+
+validate_secret_filename() {
+    local filename="$1" label="$2"
+
+    [[ "$filename" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || {
+        echo "fatal: $label must be a filename within $secrets_dir containing only letters, digits, dots, underscores, and hyphens" >&2
+        return 1
+    }
+}
+
 validate_catalog() {
     local require_enabled="${1:-0}"
+    local summary name hostname remote_ip remote_port local_port database credentials_file enabled
+    local candidate
+    local -A validated_credentials=()
+
     [[ -r "$catalog" ]] || { echo "fatal: catalog is not readable: $catalog" >&2; return 1; }
-    awk -v mode=summary -v require_enabled="$require_enabled" -f "$validator" "$catalog"
+    summary=$(awk -v mode=summary -v require_enabled="$require_enabled" -f "$validator" "$catalog") || return 1
+
+    while IFS=, read -r name hostname remote_ip remote_port local_port database credentials_file enabled; do
+        candidate="$secrets_dir/$credentials_file"
+        if [[ -z "${validated_credentials[$candidate]+present}" ]]; then
+            validate_credentials_file "$candidate" "credentials" || return 1
+            validated_credentials[$candidate]=1
+        fi
+    done < <(awk -v mode=records -v require_enabled="$require_enabled" -f "$validator" "$catalog")
+
+    echo "$summary"
 }
 
 check_docker() {
@@ -40,9 +126,13 @@ check_docker() {
         echo "fatal: Docker CLI is not installed" >&2
         return 1
     }
-    docker info >/dev/null 2>&1 || {
-        echo "fatal: cannot access the Docker daemon as user $(id -un)" >&2
-        echo "Start Docker and grant this user daemon access; this launcher will not invoke sudo automatically." >&2
+    command -v timeout >/dev/null 2>&1 || {
+        echo "fatal: timeout command is not installed" >&2
+        return 1
+    }
+    timeout 10 docker info >/dev/null 2>&1 || {
+        echo "fatal: Docker daemon is unavailable, inaccessible, or did not respond within 10 seconds" >&2
+        echo "Start Docker and grant this user daemon access; this launcher never uses sudo." >&2
         return 1
     }
 }
@@ -70,11 +160,15 @@ install_profile() {
 
 start_proxy() {
     local vpn_username vpn_password vpn_otp runtime_dir auth_file
-    local name hostname remote_ip remote_port local_port database enabled
-    local exit_status profile_mode
+    local name hostname remote_ip remote_port local_port database credentials_file enabled
+    local local_ip http_proxy_port https_proxy_port
+    local exit_status profile_mode vpn_credentials
     declare -a docker_args=()
 
-    validate_catalog 1
+    validate_all_catalogs 1
+    validate_secret_filename "$vpn_credentials_file" "VPN_CREDENTIALS_FILE" || return 1
+    vpn_credentials="$secrets_dir/$vpn_credentials_file"
+    validate_credentials_file "$vpn_credentials" "VPN credentials" || return 1
     check_docker
     check_tun
     [[ -r "$profile" ]] || {
@@ -94,14 +188,18 @@ start_proxy() {
         docker build --tag "$image_name" "$project_dir"
     fi
 
-    read -r -p "VPN username: " vpn_username
-    read -r -s -p "VPN password: " vpn_password
-    printf '\n'
+    IFS=, read -r vpn_username vpn_password < "$vpn_credentials" || {
+        [[ -n "$vpn_username" && -n "$vpn_password" ]] || {
+            echo "fatal: failed to read VPN credentials: $vpn_credentials" >&2
+            return 1
+        }
+    }
+
     read -r -s -p "VPN OTP: " vpn_otp
     printf '\n'
 
-    [[ -n "$vpn_username" && -n "$vpn_password" && -n "$vpn_otp" ]] || {
-        echo "fatal: username, password, and OTP are all required" >&2
+    [[ -n "$vpn_otp" ]] || {
+        echo "fatal: OTP is required" >&2
         return 1
     }
 
@@ -113,6 +211,7 @@ start_proxy() {
     unset vpn_username vpn_password vpn_otp
 
     cleanup_auth() {
+        trap - EXIT INT TERM HUP
         if [[ -n "${auth_file:-}" ]]; then
             rm -f -- "$auth_file"
         fi
@@ -120,13 +219,18 @@ start_proxy() {
             rmdir -- "$runtime_dir" 2>/dev/null || true
         fi
     }
-    trap cleanup_auth EXIT INT TERM
+    trap cleanup_auth EXIT INT TERM HUP
 
-    while IFS=, read -r name hostname remote_ip remote_port local_port database enabled; do
+    while IFS=, read -r name hostname remote_ip remote_port local_port database credentials_file enabled; do
         docker_args+=(--publish "127.0.0.1:${local_port}:${local_port}/tcp")
     done < <(awk -v mode=records -v require_enabled=1 -f "$validator" "$catalog")
 
-    echo "Starting $container_name. The host network namespace will not be modified."
+    while IFS=, read -r name hostname remote_ip local_ip http_proxy_port https_proxy_port enabled; do
+        docker_args+=(--publish "${local_ip}:80:${http_proxy_port}/tcp")
+        docker_args+=(--publish "${local_ip}:443:${https_proxy_port}/tcp")
+    done < <(web_records)
+
+    echo "Starting $container_name. VPN routes remain isolated inside the container."
     set +e
     docker run --rm \
         --name "$container_name" \
@@ -142,20 +246,20 @@ start_proxy() {
         --stop-timeout 10 \
         --mount "type=bind,src=$profile,dst=/vpn/client.ovpn,readonly" \
         --mount "type=bind,src=$catalog,dst=/config/destinations.csv,readonly" \
+        --mount "type=bind,src=$web_catalog,dst=/config/web-hosts.csv,readonly" \
         --mount "type=bind,src=$auth_file,dst=/run-auth/auth.txt,readonly" \
         "${docker_args[@]}" \
         "$image_name"
     exit_status=$?
     set -e
     cleanup_auth
-    trap - EXIT INT TERM
     return "$exit_status"
 }
 
 command_name="${1:-}"
 case "$command_name" in
     validate)
-        validate_catalog 0
+        validate_all_catalogs 0
         ;;
     build)
         build_image

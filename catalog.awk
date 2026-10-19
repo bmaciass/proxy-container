@@ -1,6 +1,6 @@
 BEGIN {
     FS = ","
-    expected_header = "name,hostname,remote_ip,remote_port,local_port,database,enabled"
+    expected_header = "name,hostname,remote_ip,remote_port,local_port,database,credentials_file,enabled"
     header_seen = 0
     enabled_count = 0
     errors = 0
@@ -35,8 +35,8 @@ function valid_ipv4(value, parts, count, i) {
         next
     }
 
-    if (NF != 7) {
-        fail("expected exactly 7 comma-separated fields")
+    if (NF != 8) {
+        fail("expected exactly 8 comma-separated fields")
         next
     }
 
@@ -46,7 +46,8 @@ function valid_ipv4(value, parts, count, i) {
     remote_port = $4
     local_port = $5
     database = $6
-    enabled = $7
+    credentials_file = $7
+    enabled = $8
 
     row_valid = 1
 
@@ -74,6 +75,10 @@ function valid_ipv4(value, parts, count, i) {
         fail("database contains unsupported characters")
         row_valid = 0
     }
+    if (credentials_file !~ /^[A-Za-z0-9][A-Za-z0-9_.-]*$/) {
+        fail("credentials_file must be a filename containing only letters, digits, dots, underscores, and hyphens")
+        row_valid = 0
+    }
     if (enabled != "true" && enabled != "false") {
         fail("enabled must be true or false")
         row_valid = 0
@@ -95,7 +100,7 @@ function valid_ipv4(value, parts, count, i) {
     }
 
     if (row_valid && enabled == "true" && mode == "records") {
-        print name "," hostname "," remote_ip "," remote_port "," local_port "," database "," enabled
+        print name "," hostname "," remote_ip "," remote_port "," local_port "," database "," credentials_file "," enabled
     }
 }
 
@@ -113,4 +118,3 @@ END {
         print "Catalog is valid (" enabled_count " enabled destination(s))."
     }
 }
-

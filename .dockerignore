@@ -1,7 +1,7 @@
 .git
 .gitignore
 destinations.csv
+web-hosts.csv
 secrets
 tests
 README.md
-

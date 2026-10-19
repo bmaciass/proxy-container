@@ -5,6 +5,8 @@ readonly profile=/vpn/client.ovpn
 readonly auth_file=/run-auth/auth.txt
 readonly catalog=/config/destinations.csv
 readonly catalog_validator=/usr/local/lib/vpn-db-proxy/catalog.awk
+readonly web_catalog=/config/web-hosts.csv
+readonly web_catalog_validator=/usr/local/lib/vpn-db-proxy/web-catalog.awk
 readonly runtime_profile=/run/client.ovpn
 readonly openvpn_log=/run/openvpn.log
 readonly openvpn_pid_file=/run/openvpn.pid
@@ -37,8 +39,14 @@ trap cleanup EXIT INT TERM
 [[ -r "$profile" ]] || { echo "fatal: VPN profile is not readable" >&2; exit 1; }
 [[ -r "$auth_file" ]] || { echo "fatal: temporary VPN auth file is not readable" >&2; exit 1; }
 [[ -r "$catalog" ]] || { echo "fatal: destinations catalog is not readable" >&2; exit 1; }
+[[ -r "$web_catalog" ]] || { echo "fatal: web hosts catalog is not readable" >&2; exit 1; }
 
 awk -v mode=summary -v require_enabled=1 -f "$catalog_validator" "$catalog"
+reserved_ports=$(awk -v mode=records -v require_enabled=1 -f "$catalog_validator" "$catalog" | awk -F, '
+    { printf "%s%s", separator, $5; separator = " " }
+')
+awk -v mode=summary -v require_enabled=0 -v reserved_ports="$reserved_ports" \
+    -f "$web_catalog_validator" "$web_catalog"
 
 # Replace the interactive directive in a runtime-only copy. The source profile,
 # including its embedded client key, remains read-only.
@@ -82,7 +90,7 @@ done
 
 echo "VPN tunnel is ready. Starting database forwards:"
 : > "$proxy_pid_file"
-while IFS=, read -r name hostname remote_ip remote_port local_port database enabled; do
+while IFS=, read -r name hostname remote_ip remote_port local_port database credentials_file enabled; do
     socat \
         "TCP-LISTEN:${local_port},fork,reuseaddr,keepalive" \
         "TCP:${remote_ip}:${remote_port},connect-timeout=10" &
@@ -93,6 +101,27 @@ while IFS=, read -r name hostname remote_ip remote_port local_port database enab
         "$name" "$local_port" "$remote_ip" "$remote_port" "$hostname" "$database"
 done < <(awk -v mode=records -v require_enabled=1 -f "$catalog_validator" "$catalog")
 
+echo "Starting web host forwards:"
+while IFS=, read -r name hostname remote_ip local_ip http_proxy_port https_proxy_port enabled; do
+    socat \
+        "TCP-LISTEN:${http_proxy_port},fork,reuseaddr,keepalive" \
+        "TCP:${remote_ip}:80,connect-timeout=10" &
+    proxy_pid=$!
+    proxy_pids+=("$proxy_pid")
+    printf '%s\n' "$proxy_pid" >> "$proxy_pid_file"
+
+    socat \
+        "TCP-LISTEN:${https_proxy_port},fork,reuseaddr,keepalive" \
+        "TCP:${remote_ip}:443,connect-timeout=10" &
+    proxy_pid=$!
+    proxy_pids+=("$proxy_pid")
+    printf '%s\n' "$proxy_pid" >> "$proxy_pid_file"
+
+    printf '  %-20s %s:80/443 -> %s:80/443 (host=%s)\n' \
+        "$name" "$local_ip" "$remote_ip" "$hostname"
+done < <(awk -v mode=records -v require_enabled=0 -v reserved_ports="$reserved_ports" \
+    -f "$web_catalog_validator" "$web_catalog")
+
 echo "Proxy is running. Press Ctrl-C to disconnect."
 while true; do
     if ! kill -0 "$openvpn_pid" 2>/dev/null; then
@@ -101,10 +130,9 @@ while true; do
     fi
     for proxy_pid in "${proxy_pids[@]}"; do
         if ! kill -0 "$proxy_pid" 2>/dev/null; then
-            echo "fatal: a database forward stopped" >&2
+            echo "fatal: a TCP forward stopped" >&2
             exit 1
         fi
     done
     sleep 2
 done
-

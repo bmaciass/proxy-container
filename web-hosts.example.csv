@@ -1,0 +1,3 @@
+# Each enabled host publishes HTTP and HTTPS on its dedicated local loopback IP.
+name,hostname,remote_ip,local_ip,enabled
+example,app.internal.example,10.0.0.20,127.0.0.2,false
